@@ -2,20 +2,22 @@
 set -e
 
 ADMIN_USER=${ADMIN_USER:-admin}
-ADMIN_PASS=${ADMIN_PASS:-$(openssl rand -hex 16)}
+ADMIN_PASS=${ADMIN_PASS:-$(openssl rand -hex 12)}
 
 echo "🚀 Brutal VPN Bootstrap starting..."
 echo "👤 Admin: $ADMIN_USER"
 
 # 1. Обновление системы
 apt-get update -y -q
-apt-get install -y -q curl socat python3
+apt-get install -y -q curl socat python3 python3-pip
+
+# Устанавливаем bcrypt для Python
+pip3 install bcrypt --quiet --break-system-packages 2>/dev/null || pip3 install bcrypt --quiet
 
 # 2. Установка Marzban
 if [ ! -d "/opt/marzban" ]; then
     echo "📦 Installing Marzban..."
     bash -c "$(curl -sL https://github.com/Gozargah/Marzban-scripts/raw/master/marzban.sh)" @ install &
-    INSTALL_PID=$!
     echo "⏳ Waiting for Marzban..."
     for i in $(seq 1 60); do
         if curl -s http://127.0.0.1:8000/ > /dev/null 2>&1; then
@@ -30,74 +32,87 @@ else
     sleep 5
 fi
 
-# 3. Создаём admin через прямой INSERT в SQLite
-echo "👤 Creating admin..."
+# Ждём пока БД создастся
 DB_PATH="/var/lib/marzban/db.sqlite3"
-sleep 3
-
-# Ждём пока БД появится
+echo "⏳ Waiting for database..."
 for i in $(seq 1 20); do
-    if [ -f "$DB_PATH" ]; then break; fi
+    if [ -f "$DB_PATH" ]; then
+        echo "✅ Database found!"
+        break
+    fi
     sleep 3
 done
 
-# Хэш пароля через Python
-PASS_HASH=$(python3 -c "
+# 3. Создаём admin напрямую через SQLite + bcrypt
+echo "👤 Creating admin in database..."
+python3 << PYEOF
+import sqlite3
 import bcrypt
-password = '$ADMIN_PASS'.encode()
-salt = bcrypt.gensalt()
-print(bcrypt.hashpw(password, salt).decode())
-" 2>/dev/null || python3 -c "
-import hashlib, os
-salt = os.urandom(16).hex()
-h = hashlib.sha256(('$ADMIN_PASS' + salt).encode()).hexdigest()
-print(h)
-")
+import sys
 
-# Создаём через API если уже есть дефолтный admin
-TOKEN=$(curl -s -X POST http://127.0.0.1:8000/api/admin/token \
-  -H "Content-Type: application/x-www-form-urlencoded" \
-  -d "username=admin&password=admin" \
-  | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('access_token',''))" 2>/dev/null || echo "")
+db_path = "/var/lib/marzban/db.sqlite3"
+username = "$ADMIN_USER"
+password = "$ADMIN_PASS"
 
-if [ -n "$TOKEN" ]; then
-    # Создаём нового sudo admin
-    curl -s -X POST http://127.0.0.1:8000/api/admin \
-      -H "Authorization: Bearer $TOKEN" \
-      -H "Content-Type: application/json" \
-      -d "{\"username\":\"$ADMIN_USER\",\"password\":\"$ADMIN_PASS\",\"is_sudo\":true}" > /dev/null 2>&1 || true
-    echo "✅ Admin created via API"
+try:
+    # Генерируем bcrypt хеш
+    hashed = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
     
-    # Проверяем что новый admin работает
-    NEW_TOKEN=$(curl -s -X POST http://127.0.0.1:8000/api/admin/token \
-      -H "Content-Type: application/x-www-form-urlencoded" \
-      -d "username=$ADMIN_USER&password=$ADMIN_PASS" \
-      | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('access_token',''))" 2>/dev/null || echo "")
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
     
-    if [ -n "$NEW_TOKEN" ]; then
-        TOKEN=$NEW_TOKEN
-        echo "✅ New admin verified"
-    fi
-else
-    # Пробуем войти с нашим паролем (уже создан)
+    # Проверяем есть ли уже такой admin
+    cursor.execute("SELECT id FROM admins WHERE username = ?", (username,))
+    existing = cursor.fetchone()
+    
+    if existing:
+        # Обновляем пароль
+        cursor.execute("UPDATE admins SET hashed_password = ?, is_sudo = 1 WHERE username = ?", 
+                      (hashed, username))
+        print(f"✅ Admin '{username}' password updated")
+    else:
+        # Создаём нового
+        cursor.execute("INSERT INTO admins (username, hashed_password, is_sudo) VALUES (?, ?, 1)",
+                      (username, hashed, True))
+        print(f"✅ Admin '{username}' created successfully")
+    
+    conn.commit()
+    conn.close()
+except Exception as e:
+    print(f"❌ Error: {e}")
+    sys.exit(1)
+PYEOF
+
+# Перезапускаем Marzban чтобы он подхватил нового admin
+echo "🔄 Restarting Marzban..."
+marzban restart > /dev/null 2>&1 || docker restart marzban-marzban-1 > /dev/null 2>&1
+sleep 5
+
+# 4. Получаем токен
+echo "🔑 Getting auth token..."
+TOKEN=""
+for i in $(seq 1 10); do
     TOKEN=$(curl -s -X POST http://127.0.0.1:8000/api/admin/token \
       -H "Content-Type: application/x-www-form-urlencoded" \
       -d "username=$ADMIN_USER&password=$ADMIN_PASS" \
       | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('access_token',''))" 2>/dev/null || echo "")
-fi
+    if [ -n "$TOKEN" ]; then
+        echo "✅ Auth token received!"
+        break
+    fi
+    sleep 3
+done
 
-# 4. Генерируем Reality ключи
+# 5. Генерируем Reality ключи
 echo "🔑 Generating Reality keys..."
-sleep 2
 KEYS=$(docker exec marzban-marzban-1 xray x25519 2>/dev/null)
 PRIVATE=$(echo "$KEYS" | grep "Private" | awk '{print $3}')
 PUBLIC=$(echo "$KEYS" | grep "Public" | awk '{print $3}')
 
-# 5. Применяем Xray конфиг
+# 6. Применяем Xray конфиг
 echo "⚙️  Applying Xray config..."
-
-if [ -n "$TOKEN" ]; then
-    curl -s -X PUT http://127.0.0.1:8000/api/core/config \
+if [ -n "$TOKEN" ] && [ -n "$PRIVATE" ]; then
+    RESULT=$(curl -s -o /dev/null -w "%{http_code}" -X PUT http://127.0.0.1:8000/api/core/config \
       -H "Authorization: Bearer $TOKEN" \
       -H "Content-Type: application/json" \
       -d "{
@@ -128,12 +143,17 @@ if [ -n "$TOKEN" ]; then
           {\"protocol\":\"freedom\",\"tag\":\"DIRECT\"},
           {\"protocol\":\"blackhole\",\"tag\":\"BLOCK\"}
         ]
-      }" > /dev/null 2>&1 && echo "✅ Xray config applied!" || echo "⚠️  Вставь конфиг вручную"
+      }")
+    if [ "$RESULT" = "200" ]; then
+        echo "✅ Xray config applied!"
+    else
+        echo "⚠️  Config apply returned $RESULT — вставь вручную"
+    fi
 else
     echo "⚠️  Вставь конфиг вручную в панели"
 fi
 
-# 6. Настраиваем socat
+# 7. Настраиваем socat
 echo "🔌 Setting up socat..."
 cat > /etc/systemd/system/socat-marzban.service << 'SERVICE'
 [Unit]
@@ -171,6 +191,6 @@ echo "📱 Панель (на Mac):"
 echo "   ssh -L 8000:localhost:8000 root@$SERVER_IP"
 echo "   http://127.0.0.1:8000/dashboard"
 echo ""
-echo "🔍 Проверка:"
+echo "🔍 Проверка API:"
 echo "   curl http://$SERVER_IP:8080/api/health"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
